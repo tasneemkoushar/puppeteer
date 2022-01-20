@@ -17,7 +17,7 @@
 import { assert } from './assert.js';
 import { helper, debugError } from './helper.js';
 import { ExecutionContext } from './ExecutionContext.js';
-import { Page } from './Page.js';
+import { Page, ScreenshotOptions } from './Page.js';
 import { CDPSession } from './Connection.js';
 import { KeyInput } from './USKeyboardLayout.js';
 import { FrameManager, Frame } from './FrameManager.js';
@@ -80,12 +80,19 @@ export function createJSHandle(
       context,
       context._client,
       remoteObject,
+      frame,
       frameManager.page(),
       frameManager
     );
   }
   return new JSHandle(context, context._client, remoteObject);
 }
+
+const applyOffsetsToQuad = (
+  quad: Array<{ x: number; y: number }>,
+  offsetX: number,
+  offsetY: number
+) => quad.map((part) => ({ x: part.x + offsetX, y: part.y + offsetY }));
 
 /**
  * Represents an in-page JavaScript object. JSHandles can be created with the
@@ -191,7 +198,7 @@ export class JSHandle<HandleObjectType = unknown> {
 
   /** Fetches a single property from the referenced object.
    */
-  async getProperty(propertyName: string): Promise<JSHandle | undefined> {
+  async getProperty(propertyName: string): Promise<JSHandle> {
     const objectHandle = await this.evaluateHandle(
       (object: Element, propertyName: string) => {
         const result = { __proto__: null };
@@ -201,7 +208,8 @@ export class JSHandle<HandleObjectType = unknown> {
       propertyName
     );
     const properties = await objectHandle.getProperties();
-    const result = properties.get(propertyName) || null;
+    const result = properties.get(propertyName);
+    assert(result instanceof JSHandle);
     await objectHandle.dispose();
     return result;
   }
@@ -330,6 +338,7 @@ export class JSHandle<HandleObjectType = unknown> {
 export class ElementHandle<
   ElementType extends Element = Element
 > extends JSHandle<ElementType> {
+  private _frame: Frame;
   private _page: Page;
   private _frameManager: FrameManager;
 
@@ -340,14 +349,69 @@ export class ElementHandle<
     context: ExecutionContext,
     client: CDPSession,
     remoteObject: Protocol.Runtime.RemoteObject,
+    frame: Frame,
     page: Page,
     frameManager: FrameManager
   ) {
     super(context, client, remoteObject);
     this._client = client;
     this._remoteObject = remoteObject;
+    this._frame = frame;
     this._page = page;
     this._frameManager = frameManager;
+  }
+
+  /**
+   * Wait for the `selector` to appear within the element. If at the moment of calling the
+   * method the `selector` already exists, the method will return immediately. If
+   * the `selector` doesn't appear after the `timeout` milliseconds of waiting, the
+   * function will throw.
+   *
+   * This method does not work across navigations or if the element is detached from DOM.
+   *
+   * @param selector - A
+   * {@link https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_Selectors | selector}
+   * of an element to wait for
+   * @param options - Optional waiting parameters
+   * @returns Promise which resolves when element specified by selector string
+   * is added to DOM. Resolves to `null` if waiting for hidden: `true` and
+   * selector is not found in DOM.
+   * @remarks
+   * The optional parameters in `options` are:
+   *
+   * - `visible`: wait for the selected element to be present in DOM and to be
+   * visible, i.e. to not have `display: none` or `visibility: hidden` CSS
+   * properties. Defaults to `false`.
+   *
+   * - `hidden`: wait for the selected element to not be found in the DOM or to be hidden,
+   * i.e. have `display: none` or `visibility: hidden` CSS properties. Defaults to
+   * `false`.
+   *
+   * - `timeout`: maximum time to wait in milliseconds. Defaults to `30000`
+   * (30 seconds). Pass `0` to disable timeout. The default value can be changed
+   * by using the {@link Page.setDefaultTimeout} method.
+   */
+  async waitForSelector(
+    selector: string,
+    options: {
+      visible?: boolean;
+      hidden?: boolean;
+      timeout?: number;
+    } = {}
+  ): Promise<ElementHandle | null> {
+    const frame = this._context.frame();
+    const secondaryContext = await frame._secondaryWorld.executionContext();
+    const adoptedRoot = await secondaryContext._adoptElementHandle(this);
+    const handle = await frame._secondaryWorld.waitForSelector(selector, {
+      ...options,
+      root: adoptedRoot,
+    });
+    await adoptedRoot.dispose();
+    if (!handle) return null;
+    const mainExecutionContext = await frame._mainWorld.executionContext();
+    const result = await mainExecutionContext._adoptElementHandle(handle);
+    await handle.dispose();
+    return result;
   }
 
   asElement(): ElementHandle<ElementType> | null {
@@ -411,31 +475,87 @@ export class ElementHandle<
     if (error) throw new Error(error);
   }
 
-  async clickablePoint(): Promise<Point> {
+  private async _getOOPIFOffsets(
+    frame: Frame
+  ): Promise<{ offsetX: number; offsetY: number }> {
+    let offsetX = 0;
+    let offsetY = 0;
+    while (frame.parentFrame()) {
+      const parent = frame.parentFrame();
+      if (!frame.isOOPFrame()) {
+        frame = parent;
+        continue;
+      }
+      const { backendNodeId } = await parent._client.send('DOM.getFrameOwner', {
+        frameId: frame._id,
+      });
+      const result = await parent._client.send('DOM.getBoxModel', {
+        backendNodeId: backendNodeId,
+      });
+      if (!result) {
+        break;
+      }
+      const contentBoxQuad = result.model.content;
+      const topLeftCorner = this._fromProtocolQuad(contentBoxQuad)[0];
+      offsetX += topLeftCorner.x;
+      offsetY += topLeftCorner.y;
+      frame = parent;
+    }
+    return { offsetX, offsetY };
+  }
+
+  /**
+   * Returns the middle point within an element unless a specific offset is provided.
+   */
+  async clickablePoint(offset?: Offset): Promise<Point> {
     const [result, layoutMetrics] = await Promise.all([
       this._client
         .send('DOM.getContentQuads', {
           objectId: this._remoteObject.objectId,
         })
         .catch(debugError),
-      this._client.send('Page.getLayoutMetrics'),
+      this._page.client().send('Page.getLayoutMetrics'),
     ]);
     if (!result || !result.quads.length)
-      throw new Error('Node is either not visible or not an HTMLElement');
+      throw new Error('Node is either not clickable or not an HTMLElement');
     // Filter out quads that have too small area to click into.
     // Fallback to `layoutViewport` in case of using Firefox.
     const { clientWidth, clientHeight } =
       layoutMetrics.cssLayoutViewport || layoutMetrics.layoutViewport;
+    const { offsetX, offsetY } = await this._getOOPIFOffsets(this._frame);
     const quads = result.quads
       .map((quad) => this._fromProtocolQuad(quad))
+      .map((quad) => applyOffsetsToQuad(quad, offsetX, offsetY))
       .map((quad) =>
         this._intersectQuadWithViewport(quad, clientWidth, clientHeight)
       )
       .filter((quad) => computeQuadArea(quad) > 1);
     if (!quads.length)
-      throw new Error('Node is either not visible or not an HTMLElement');
-    // Return the middle point of the first quad.
+      throw new Error('Node is either not clickable or not an HTMLElement');
     const quad = quads[0];
+    if (offset) {
+      // Return the point of the first quad identified by offset.
+      let minX = Number.MAX_SAFE_INTEGER;
+      let minY = Number.MAX_SAFE_INTEGER;
+      for (const point of quad) {
+        if (point.x < minX) {
+          minX = point.x;
+        }
+        if (point.y < minY) {
+          minY = point.y;
+        }
+      }
+      if (
+        minX !== Number.MAX_SAFE_INTEGER &&
+        minY !== Number.MAX_SAFE_INTEGER
+      ) {
+        return {
+          x: minX + offset.x,
+          y: minY + offset.y,
+        };
+      }
+    }
+    // Return the middle point of the first quad.
     let x = 0;
     let y = 0;
     for (const point of quad) {
@@ -495,7 +615,7 @@ export class ElementHandle<
    */
   async click(options: ClickOptions = {}): Promise<void> {
     await this._scrollIntoViewIfNeeded();
-    const { x, y } = await this.clickablePoint();
+    const { x, y } = await this.clickablePoint(options.offset);
     await this._page.mouse.click(x, y, options);
   }
 
@@ -750,13 +870,14 @@ export class ElementHandle<
 
     if (!result) return null;
 
+    const { offsetX, offsetY } = await this._getOOPIFOffsets(this._frame);
     const quad = result.model.border;
     const x = Math.min(quad[0], quad[2], quad[4], quad[6]);
     const y = Math.min(quad[1], quad[3], quad[5], quad[7]);
     const width = Math.max(quad[0], quad[2], quad[4], quad[6]) - x;
     const height = Math.max(quad[1], quad[3], quad[5], quad[7]) - y;
 
-    return { x, y, width, height };
+    return { x: x + offsetX, y: y + offsetY, width, height };
   }
 
   /**
@@ -772,12 +893,30 @@ export class ElementHandle<
 
     if (!result) return null;
 
+    const { offsetX, offsetY } = await this._getOOPIFOffsets(this._frame);
+
     const { content, padding, border, margin, width, height } = result.model;
     return {
-      content: this._fromProtocolQuad(content),
-      padding: this._fromProtocolQuad(padding),
-      border: this._fromProtocolQuad(border),
-      margin: this._fromProtocolQuad(margin),
+      content: applyOffsetsToQuad(
+        this._fromProtocolQuad(content),
+        offsetX,
+        offsetY
+      ),
+      padding: applyOffsetsToQuad(
+        this._fromProtocolQuad(padding),
+        offsetX,
+        offsetY
+      ),
+      border: applyOffsetsToQuad(
+        this._fromProtocolQuad(border),
+        offsetX,
+        offsetY
+      ),
+      margin: applyOffsetsToQuad(
+        this._fromProtocolQuad(margin),
+        offsetX,
+        offsetY
+      ),
       width,
       height,
     };
@@ -788,7 +927,7 @@ export class ElementHandle<
    * {@link Page.screenshot} to take a screenshot of the element.
    * If the element is detached from DOM, the method throws an error.
    */
-  async screenshot(options = {}): Promise<string | Buffer | void> {
+  async screenshot(options: ScreenshotOptions = {}): Promise<string | Buffer> {
     let needsViewportReset = false;
 
     let boundingBox = await this.boundingBox();
@@ -994,20 +1133,35 @@ export class ElementHandle<
   /**
    * Resolves to true if the element is visible in the current viewport.
    */
-  async isIntersectingViewport(): Promise<boolean> {
-    return await this.evaluate<(element: Element) => Promise<boolean>>(
-      async (element) => {
-        const visibleRatio = await new Promise((resolve) => {
-          const observer = new IntersectionObserver((entries) => {
-            resolve(entries[0].intersectionRatio);
-            observer.disconnect();
-          });
-          observer.observe(element);
+  async isIntersectingViewport(options?: {
+    threshold?: number;
+  }): Promise<boolean> {
+    const { threshold = 0 } = options || {};
+    return await this.evaluate(async (element: Element, threshold: number) => {
+      const visibleRatio = await new Promise<number>((resolve) => {
+        const observer = new IntersectionObserver((entries) => {
+          resolve(entries[0].intersectionRatio);
+          observer.disconnect();
         });
-        return visibleRatio > 0;
-      }
-    );
+        observer.observe(element);
+      });
+      return threshold === 1 ? visibleRatio === 1 : visibleRatio > threshold;
+    }, threshold);
   }
+}
+
+/**
+ * @public
+ */
+export interface Offset {
+  /**
+   * x-offset for the clickable point relative to the top-left corder of the border box.
+   */
+  x: number;
+  /**
+   * y-offset for the clickable point relative to the top-left corder of the border box.
+   */
+  y: number;
 }
 
 /**
@@ -1028,6 +1182,10 @@ export interface ClickOptions {
    * @defaultValue 1
    */
   clickCount?: number;
+  /**
+   * Offset for the clickable point relative to the top-left corder of the border box.
+   */
+  offset?: Offset;
 }
 
 /**
