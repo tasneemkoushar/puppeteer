@@ -1,4 +1,4 @@
-# Puppeteer
+# Puppete
 
 <!-- [START badges] -->
 
